@@ -1,0 +1,6 @@
+pyrogram>=2.0.106
+motor>=3.3.2
+aiohttp>=3.9.3
+mangaplus>=2.1.2
+python-dotenv>=1.0.1
+tgcrypto>=1.2.5
