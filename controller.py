@@ -308,9 +308,16 @@ async def task_uploader():
         await asyncio.sleep(1)
 
 async def main():
+    # 1. Start the web server IMMEDIATELY so Render sees the open port
+    asyncio.create_task(web_server())
+    
+    # 2. Connect to Telegram
+    logger.info("Connecting to Telegram...")
     await app.start()
+    
+    # 3. Warm up and start background tasks
     await warm_up()
-    await asyncio.gather(web_server(), task_poller(), task_downloader(), task_uploader())
+    await asyncio.gather(task_poller(), task_downloader(), task_uploader())
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
