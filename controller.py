@@ -1,7 +1,15 @@
 import asyncio
+import sys
+
+# --- CRITICAL FIX FOR PYTHON 3.14+ (MUST BE AT THE VERY TOP) ---
+# We have to create the event loop BEFORE importing Pyrogram, or it crashes on Render.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import logging
 import os
-import sys
 import uuid
 import aiohttp
 from datetime import datetime, timedelta, timezone
@@ -13,12 +21,6 @@ from mangaplus.constants import Language, Viewer
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# --- FIX: FORCE EVENT LOOP FOR PYTHON 3.14+ ---
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
 
 # --- CONFIGURATION ---
 API_ID = int(os.getenv("API_ID", "0"))
@@ -41,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("MangaController")
 
 if not MONGO_URL or not SESSION_STRING:
-    logger.error("❌ Config Missing!")
+    logger.error("❌ Config Missing! Make sure MONGO_URL and SESSION_STRING are set.")
     sys.exit(1)
 
 mongo = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
@@ -82,7 +84,6 @@ def find_all_mangas(data, results_list):
             raw_chapter = data.get('chapterName') or data.get('chapter_name') or data.get('name') or "Unknown"
             
             if manga_name:
-                # Strip the # and clean the chapter string so the worker bot accepts it
                 clean_chapter = str(raw_chapter).replace("#", "").strip()
                 results_list.append({
                     'manga_name': manga_name,
@@ -104,21 +105,22 @@ async def wait_for_result(start_time, target_title, target_ep, timeout=7200):
             return "timeout"
 
         try:
-            # Check last 20 messages
-            async for msg in app.get_chat_history(TARGET_GROUP, limit=20):
+            # We check the last 50 messages so we don't miss the original message that gets edited
+            async for msg in app.get_chat_history(TARGET_GROUP, limit=50):
                 text = (msg.text or msg.caption or "").lower()
                 if not text: continue
                 
+                # Check if it was edited recently
                 msg_time = msg.edit_date or msg.date
                 if msg_time < (start_time - timedelta(seconds=10)):
                     continue
 
-                # 1. SPECIFIC SUCCESS TRIGGER (Looks for "✅ Done!" from your worker bot)
-                if "✅ done!" in text and target_title.lower() in text and str(target_ep).lower() in text:
+                # SUCCESS TRIGGER: Catches "✅ Done!" or "✅ Batch complete!" when the worker bot edits its message
+                if ("✅ done!" in text or "✅ batch complete!" in text) and target_title.lower() in text:
                     logger.info(f"✅ Detect: Success for {target_title}")
                     return "success"
                 
-                # 2. CRITICAL FAILURE TRIGGER
+                # FAILURE TRIGGER
                 if "❌ error:" in text and target_title.lower() in text:
                     logger.info(f"❌ Detect: Explicit Failure for {target_title}")
                     return "failed"
@@ -151,21 +153,16 @@ async def start(client, message):
 
 @app.on_message(filters.command("list"))
 async def list_tracked(client, message):
-    """Replies to /list with the mangas currently stored in MongoDB"""
     if not await is_admin(message): return
-    
     count = await col_queue.count_documents({"status": "done"})
     if count == 0:
         await message.reply_text("Still gathering data or no mangas tracked yet... Wait a moment!")
         return
         
     text = f"📊 **Currently tracking {count} series in MongoDB!**\n\n**Latest Updates Found:**\n"
-    
-    # Get 20 recent records from the database
     cursor = col_queue.find({"status": "done"}).sort([("found_at", -1)]).limit(20)
     async for doc in cursor:
         text += f"• {doc.get('title')} (Chapter: {doc.get('ep')})\n"
-        
     await message.reply_text(text)
 
 @app.on_message(filters.command("queue"))
@@ -235,16 +232,13 @@ async def task_poller():
                     continue
                 seen_in_this_fetch.add(unique_id)
                 
-                # Check if this exact chapter exists in the DB
                 if not await col_queue.find_one({"_id": unique_id}):
                     if not first_run_sync:
-                        # First run: mark as done so we don't download everything
                         await col_queue.insert_one({
                             "_id": unique_id, "title": title, "ep": ep,
                             "found_at": datetime.now(timezone.utc), "status": "done", "retry_count": 0
                         })
                     else:
-                        # Normal run: queue it for download
                         await col_queue.insert_one({
                             "_id": unique_id, "title": title, "ep": ep,
                             "found_at": datetime.now(timezone.utc), "status": "pending", "retry_count": 0
@@ -259,7 +253,6 @@ async def task_poller():
         except Exception as e:
             logger.error(f"Polling Error: {e}")
             
-        # POLLER COOLDOWN: Checks MangaPlus every 10 Minutes (600 Seconds)
         await asyncio.sleep(600)
 
 async def task_downloader():
@@ -280,11 +273,9 @@ async def task_downloader():
             logger.info(f"▶️ [START] Processing: {title} Ch {ep}")
             start_time = datetime.now(timezone.utc)
             
-            # Send command to group
             dl_cmd = f'/dl "{title}" -c {ep} -pdf'
             await app.send_message(TARGET_GROUP, dl_cmd)
             
-            # Wait for worker bot to confirm success
             result = await wait_for_result(start_time, title, ep, timeout=7200)
 
             if result == "success":
@@ -294,7 +285,6 @@ async def task_downloader():
                 logger.info("❄️ Success. Worker resting for 10 minutes...")
                 await app.send_message(TARGET_GROUP, f"💤 Success! Manga Worker resting 10m after **{title}**...")
                 
-                # DOWNLOADER COOLDOWN: Rests for 10 Minutes (600 Seconds) before downloading the next one
                 await asyncio.sleep(600) 
 
             else: 
@@ -320,7 +310,6 @@ async def task_uploader():
 async def main():
     await app.start()
     await warm_up()
-    # Run the web server, poller, and downloader simultaneously
     await asyncio.gather(web_server(), task_poller(), task_downloader(), task_uploader())
 
 if __name__ == "__main__":
